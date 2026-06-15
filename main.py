@@ -82,10 +82,11 @@ def create_new_acct():
     try:
         cursor.execute(sql_query, (user, hashed_pw, fName, lName, email, phone))
         conn.commit()
-        print("Created new user")
+        create_acct_success_page()
+
     except mysql.connector.Error as err:
         if err.errno == 1062:
-            ui_values["err_msg"].config(text="Invalid Username or Password")
+            ui_values["err_msg"].config(text="Could Not Create Account: Duplicate Username, Email, or Phone")
             root.after(2000, clear_err_msg)
         else:
             ui_values["err_msg"].config(text="Internal Database Error")
@@ -210,12 +211,23 @@ def create_acct_page(e):
 def login_success_page():
     clear_screen()
     root.geometry("400x280")
-    ui_values["title"] = tk.Label(root, text="Logged In Successfully", fg="green", font=("Arial", 20, "bold"))
+    ui_values["title"] = tk.Label(root, text="Logged In Successfully!", fg="green", font=("Arial", 20, "bold"))
     ui_values["title"].pack(pady=100)
 
     ui_values["diff_page_btn"] = tk.Label(root, text="Back To Login Screen", cursor="hand2", font=("Arial", 8, "underline"))
     ui_values["diff_page_btn"].pack(pady=1)
     ui_values["diff_page_btn"].bind("<Button-1>", login_page)
+
+# Created new account success screen
+def create_acct_success_page():
+    clear_screen()
+    root.geometry("400x280")
+    ui_values["title"] = tk.Label(root, text="Account Created Successfully!", fg="green", font=("Arial", 18, "bold"))
+    ui_values["title"].pack(pady=100)
+    ui_values["diff_page_btn"] = tk.Label(root, text="Back To Login Screen", cursor="hand2", font=("Arial", 8, "underline"))
+    ui_values["diff_page_btn"].pack(pady=1)
+    ui_values["diff_page_btn"].bind("<Button-1>", login_page)
+    root.after(2000, login_page, None)
 
 # Create UI and start UI loop
 root = tk.Tk()
