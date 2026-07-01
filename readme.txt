@@ -5,7 +5,7 @@ Group Members & Contributions
 -----------------------------
 Kipp Reitzel - GUI and database code
 Sofiia Unkovskaia - GUI and database code, recorded video #1
-Gor Navasardyan - GUI and database code, recorded video #3
+Gor Navasardyan - GUI and database code, recorded video #2
 
 Install & Configure
 -------------------
@@ -47,4 +47,4 @@ Phase 2 Features
 
 Demo Video
 ----------
-(Gor add the YouTube URL here before submission.)
+https://youtu.be/mrOegX8nRZg
