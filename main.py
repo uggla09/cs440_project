@@ -1,5 +1,6 @@
 import re
 from datetime import date
+from decimal import Decimal
 import mysql.connector
 import json
 import hashlib
@@ -12,6 +13,62 @@ ERR_MSG_DURATION = 3000
 MAX_ITEMS_PER_DAY = 2
 MAX_REVIEWS_PER_DAY = 2
 REVIEW_SCORES = ("Excellent", "Good", "Fair", "Poor")
+JULY_FOURTH_2024 = date(2024, 7, 4)
+REQUIRED_TABLES = ("user", "item", "category", "item_category", "review")
+_err_after_id = None
+
+SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS user (
+      username VARCHAR(255) PRIMARY KEY,
+      password VARCHAR(255) NOT NULL,
+      firstName VARCHAR(255) NOT NULL,
+      lastName VARCHAR(255) NOT NULL,
+      email VARCHAR(255) NOT NULL,
+      phone VARCHAR(255) NOT NULL,
+      CONSTRAINT u_email UNIQUE (email),
+      CONSTRAINT u_phone UNIQUE (phone)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS item (
+      itemId INT AUTO_INCREMENT PRIMARY KEY,
+      title VARCHAR(255) NOT NULL,
+      description TEXT NOT NULL,
+      postDate DATE NOT NULL,
+      price DECIMAL(10, 2) NOT NULL,
+      postedBy VARCHAR(255) NOT NULL,
+      CONSTRAINT fk_item_posted_by FOREIGN KEY (postedBy) REFERENCES user(username)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS category (
+      categoryName VARCHAR(255) PRIMARY KEY
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS item_category (
+      itemId INT NOT NULL,
+      categoryName VARCHAR(255) NOT NULL,
+      PRIMARY KEY (itemId, categoryName),
+      CONSTRAINT fk_item_category_item FOREIGN KEY (itemId) REFERENCES item(itemId) ON DELETE CASCADE,
+      CONSTRAINT fk_item_category_category FOREIGN KEY (categoryName) REFERENCES category(categoryName)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS review (
+      reviewId INT AUTO_INCREMENT PRIMARY KEY,
+      itemId INT NOT NULL,
+      reviewer VARCHAR(255) NOT NULL,
+      score ENUM('Excellent', 'Good', 'Fair', 'Poor') NOT NULL,
+      remark TEXT NOT NULL,
+      reviewDate DATE NOT NULL,
+      CONSTRAINT uq_review_item_reviewer UNIQUE (itemId, reviewer),
+      CONSTRAINT fk_review_item FOREIGN KEY (itemId) REFERENCES item(itemId) ON DELETE CASCADE,
+      CONSTRAINT fk_review_reviewer FOREIGN KEY (reviewer) REFERENCES user(username)
+    )
+    """,
+]
 
 current_user = None
 
@@ -30,7 +87,7 @@ try:
         credentials = json.load(json_data)
     conn = mysql.connector.connect(
         host=credentials["host"],
-        port=credentials["port"],
+        port=int(credentials["port"]),
         user=credentials["user"],
         password=credentials["pw"],
         database=credentials["db"],
@@ -41,19 +98,79 @@ except (FileNotFoundError, json.JSONDecodeError, KeyError, mysql.connector.Error
     messagebox.showerror("Startup Error", f"Could not connect to database:\n{e}")
     raise SystemExit(1)
 
+_schema_setup_error = ""
+
+
+def get_missing_tables():
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SHOW TABLES")
+        existing = {row[0] for row in cursor.fetchall()}
+    finally:
+        cursor.close()
+    return [table for table in REQUIRED_TABLES if table not in existing]
+
+
+def ensure_database_schema():
+    missing = get_missing_tables()
+    if not missing:
+        return True, ""
+
+    cursor = conn.cursor()
+    try:
+        for statement in SCHEMA_STATEMENTS:
+            cursor.execute(statement)
+        conn.commit()
+    except mysql.connector.Error as err:
+        conn.rollback()
+        return False, str(err)
+    finally:
+        cursor.close()
+
+    still_missing = get_missing_tables()
+    if still_missing:
+        return False, "Still missing tables: " + ", ".join(still_missing)
+    return True, ""
+
+
+_schema_ok, _schema_setup_error = ensure_database_schema()
+
 
 def register_widget(widget):
     ui_values["extra"].append(widget)
 
 
+def cancel_err_timer():
+    global _err_after_id
+    if _err_after_id is not None:
+        try:
+            root.after_cancel(_err_after_id)
+        except (tk.TclError, ValueError):
+            pass
+        _err_after_id = None
+
+
+def widget_exists(widget):
+    if not widget:
+        return False
+    try:
+        return bool(widget.winfo_exists())
+    except tk.TclError:
+        return False
+
+
 def clear_err_msg():
-    if ui_values["err_msg"]:
+    if widget_exists(ui_values["err_msg"]):
         ui_values["err_msg"].config(text="")
 
 
 def show_err(text):
+    global _err_after_id
+    cancel_err_timer()
+    if not widget_exists(ui_values["err_msg"]):
+        return
     ui_values["err_msg"].config(text=text)
-    root.after(ERR_MSG_DURATION, clear_err_msg)
+    _err_after_id = root.after(ERR_MSG_DURATION, clear_err_msg)
 
 
 def check_for_empty_fields():
@@ -219,9 +336,13 @@ def submit_item():
         conn.commit()
         messagebox.showinfo("Success", f"Item Posted Successfully (ID: {item_id})")
         home_menu(None)
-    except mysql.connector.Error:
+    except mysql.connector.Error as err:
         conn.rollback()
-        show_err("Database Error — Could Not Post Item")
+        if err.errno == 1146:
+            show_err("Database Not Set Up — Run: python setup_database.py")
+        else:
+            show_err(f"Database Error — Could Not Post Item ({err.msg})")
+        print(f"Post item DB error: {err}")
     finally:
         cursor.close()
 
@@ -382,6 +503,139 @@ def submit_review():
         cursor.close()
 
 
+def format_cell(value):
+    if isinstance(value, Decimal):
+        return f"${value:.2f}"
+    return value
+
+
+def run_select_query(query, params=()):
+    cursor = conn.cursor()
+    try:
+        cursor.execute(query, params)
+        return cursor.fetchall(), None
+    except mysql.connector.Error:
+        return None, "Database Error — Query Failed"
+    finally:
+        cursor.close()
+
+
+def populate_results_tree(tree, rows):
+    for row in tree.get_children():
+        tree.delete(row)
+    for row in rows:
+        tree.insert("", tk.END, values=tuple(format_cell(v) for v in row))
+
+
+def create_results_tree(parent, columns, headings, widths):
+    table_frame = tk.Frame(parent)
+    table_frame.pack(pady=8, padx=15, fill=tk.BOTH, expand=True)
+    register_widget(table_frame)
+
+    tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
+    for col, heading, width in zip(columns, headings, widths):
+        tree.heading(col, text=heading)
+        tree.column(col, width=width, anchor=tk.CENTER if col in ("id", "price", "count", "postDate") else tk.W)
+    tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    tree.configure(yscrollcommand=scrollbar.set)
+    register_widget(scrollbar)
+    return tree
+
+
+def query_most_expensive_per_category():
+    query = (
+        "SELECT ic.categoryName, i.itemId, i.title, i.price, i.postedBy "
+        "FROM item i "
+        "JOIN item_category ic ON i.itemId = ic.itemId "
+        "JOIN ( "
+        "  SELECT ic2.categoryName, MAX(i2.price) AS max_price "
+        "  FROM item i2 "
+        "  JOIN item_category ic2 ON i2.itemId = ic2.itemId "
+        "  GROUP BY ic2.categoryName "
+        ") mx ON ic.categoryName = mx.categoryName AND i.price = mx.max_price "
+        "ORDER BY ic.categoryName, i.itemId;"
+    )
+    return run_select_query(query)
+
+
+def query_users_same_day_categories(cat_x, cat_y):
+    query = (
+        "SELECT DISTINCT i1.postedBy, i1.postDate "
+        "FROM item i1 "
+        "JOIN item_category ic1 ON i1.itemId = ic1.itemId "
+        "JOIN item i2 ON i1.postedBy = i2.postedBy "
+        "  AND i1.postDate = i2.postDate "
+        "  AND i1.itemId < i2.itemId "
+        "JOIN item_category ic2 ON i2.itemId = ic2.itemId "
+        "WHERE ic1.categoryName = %s AND ic2.categoryName = %s "
+        "ORDER BY i1.postedBy, i1.postDate;"
+    )
+    return run_select_query(query, (cat_x, cat_y))
+
+
+def query_user_items_good_reviews_only(username):
+    query = (
+        "SELECT i.itemId, i.title, i.price, i.postDate "
+        "FROM item i "
+        "WHERE i.postedBy = %s "
+        "  AND EXISTS (SELECT 1 FROM review r WHERE r.itemId = i.itemId) "
+        "  AND NOT EXISTS ( "
+        "    SELECT 1 FROM review r "
+        "    WHERE r.itemId = i.itemId AND r.score NOT IN ('Excellent', 'Good') "
+        "  ) "
+        "ORDER BY i.itemId;"
+    )
+    return run_select_query(query, (username,))
+
+
+def query_top_posters_on_july_fourth():
+    query = (
+        "SELECT postedBy, COUNT(*) AS item_count "
+        "FROM item "
+        "WHERE postDate = %s "
+        "GROUP BY postedBy "
+        "HAVING COUNT(*) = ( "
+        "  SELECT MAX(day_count) FROM ( "
+        "    SELECT COUNT(*) AS day_count "
+        "    FROM item "
+        "    WHERE postDate = %s "
+        "    GROUP BY postedBy "
+        "  ) AS daily_totals "
+        ") "
+        "ORDER BY postedBy;"
+    )
+    return run_select_query(query, (JULY_FOURTH_2024, JULY_FOURTH_2024))
+
+
+def query_users_all_poor_reviews():
+    query = (
+        "SELECT reviewer, COUNT(*) AS review_count "
+        "FROM review "
+        "GROUP BY reviewer "
+        "HAVING SUM(CASE WHEN score = 'Poor' THEN 0 ELSE 1 END) = 0 "
+        "ORDER BY reviewer;"
+    )
+    return run_select_query(query)
+
+
+def query_users_no_poor_reviews_on_items():
+    query = (
+        "SELECT DISTINCT i.postedBy "
+        "FROM item i "
+        "WHERE NOT EXISTS ( "
+        "  SELECT 1 "
+        "  FROM item i2 "
+        "  JOIN review r ON r.itemId = i2.itemId "
+        "  WHERE i2.postedBy = i.postedBy AND r.score = 'Poor' "
+        ") "
+        "ORDER BY i.postedBy;"
+    )
+    return run_select_query(query)
+
+
 def logout():
     global current_user
     current_user = None
@@ -389,14 +643,19 @@ def logout():
 
 
 def clear_screen():
+    cancel_err_timer()
     if ui_values["title"]:
         ui_values["title"].destroy()
+        ui_values["title"] = None
     if ui_values["verify_btn"]:
         ui_values["verify_btn"].destroy()
+        ui_values["verify_btn"] = None
     if ui_values["diff_page_btn"]:
         ui_values["diff_page_btn"].destroy()
+        ui_values["diff_page_btn"] = None
     if ui_values["err_msg"]:
         ui_values["err_msg"].destroy()
+        ui_values["err_msg"] = None
     for val in ui_values["inputs"].values():
         if val is not None:
             val.destroy()
@@ -429,7 +688,7 @@ def login_page(e):
     ui_values["inputs"]["pw"] = pw_val
 
     ui_values["verify_btn"] = tk.Button(
-        root, text="Login", width=15, bg="#2196F3", fg="white",
+        root, text="Login", width=15, bg="#2196F3", fg="black", activeforeground="black",
         font=("Arial", 10, "bold"), command=verify_login,
     )
     ui_values["verify_btn"].pack(pady=10)
@@ -501,7 +760,7 @@ def create_acct_page(e):
     ui_values["inputs"]["phone"] = phone_val
 
     ui_values["verify_btn"] = tk.Button(
-        root, text="Register Now", width=15, bg="#4CAF50", fg="white",
+        root, text="Register Now", width=15, bg="#4CAF50", fg="black", activeforeground="black",
         font=("Arial", 10, "bold"), command=create_new_acct,
     )
     ui_values["verify_btn"].pack(pady=10)
@@ -524,31 +783,38 @@ def login_success_page(user):
 
 def home_menu(e):
     clear_screen()
-    root.geometry("400x320")
+    root.geometry("420x420")
     ui_values["title"] = tk.Label(
         root, text=f"Welcome, {current_user}!", fg="green", font=("Arial", 18, "bold"),
     )
-    ui_values["title"].pack(pady=25)
+    ui_values["title"].pack(pady=20)
 
     post_btn = tk.Button(
-        root, text="Post New Item", width=20, bg="#4CAF50", fg="white",
+        root, text="Post New Item", width=22, bg="#4CAF50", fg="black", activeforeground="black",
         font=("Arial", 10, "bold"), command=post_item_page,
     )
-    post_btn.pack(pady=8)
+    post_btn.pack(pady=6)
     register_widget(post_btn)
 
     search_btn = tk.Button(
-        root, text="Search Items", width=20, bg="#2196F3", fg="white",
+        root, text="Search Items", width=22, bg="#2196F3", fg="black", activeforeground="black",
         font=("Arial", 10, "bold"), command=search_items_page,
     )
-    search_btn.pack(pady=8)
+    search_btn.pack(pady=6)
     register_widget(search_btn)
 
+    reports_btn = tk.Button(
+        root, text="Reports & Queries", width=22, bg="#9C27B0", fg="black", activeforeground="black",
+        font=("Arial", 10, "bold"), command=reports_menu_page,
+    )
+    reports_btn.pack(pady=6)
+    register_widget(reports_btn)
+
     logout_btn = tk.Button(
-        root, text="Logout", width=20, bg="#757575", fg="white",
+        root, text="Logout", width=22, bg="#757575", fg="black", activeforeground="black",
         font=("Arial", 10, "bold"), command=logout,
     )
-    logout_btn.pack(pady=8)
+    logout_btn.pack(pady=6)
     register_widget(logout_btn)
 
 
@@ -587,7 +853,7 @@ def post_item_page(e=None):
     ui_values["inputs"]["price"] = price_val
 
     ui_values["verify_btn"] = tk.Button(
-        root, text="Post Item", width=15, bg="#4CAF50", fg="white",
+        root, text="Post Item", width=15, bg="#4CAF50", fg="black", activeforeground="black",
         font=("Arial", 10, "bold"), command=submit_item,
     )
     ui_values["verify_btn"].pack(pady=12)
@@ -622,7 +888,7 @@ def search_items_page(e=None):
     ui_values["inputs"]["category"] = cat_val
 
     search_btn = tk.Button(
-        search_frame, text="Search", width=10, bg="#2196F3", fg="white",
+        search_frame, text="Search", width=10, bg="#2196F3", fg="black", activeforeground="black",
         font=("Arial", 9, "bold"), command=perform_search,
     )
     search_btn.pack(side=tk.LEFT, padx=5)
@@ -655,7 +921,7 @@ def search_items_page(e=None):
     register_widget(scrollbar)
 
     ui_values["verify_btn"] = tk.Button(
-        root, text="Write Review", width=15, bg="#FF9800", fg="white",
+        root, text="Write Review", width=15, bg="#FF9800", fg="black", activeforeground="black",
         font=("Arial", 10, "bold"), command=open_review_page,
     )
     ui_values["verify_btn"].pack(pady=8)
@@ -701,7 +967,7 @@ def review_page():
     ui_values["inputs"]["remark"] = remark_val
 
     ui_values["verify_btn"] = tk.Button(
-        root, text="Submit Review", width=15, bg="#FF9800", fg="white",
+        root, text="Submit Review", width=15, bg="#FF9800", fg="black", activeforeground="black",
         font=("Arial", 10, "bold"), command=submit_review,
     )
     ui_values["verify_btn"].pack(pady=12)
@@ -715,6 +981,327 @@ def review_page():
     register_widget(back_lbl)
 
     root.bind("<Return>", lambda event: submit_review())
+
+
+def reports_menu_page(e=None):
+    clear_screen()
+    root.geometry("480x460")
+    ui_values["title"] = tk.Label(root, text="Phase 3 Reports", font=("Arial", 16, "bold"))
+    ui_values["title"].pack(pady=12)
+
+    report_buttons = [
+        ("Most Expensive Item Per Category", report_q1_page),
+        ("Same-Day Posters (Category X & Y)", report_q2_page),
+        ("User Items With Only Good Reviews", report_q3_page),
+        ("Top Posters on 7/4/2024", report_q4_page),
+        ("Users With Only Poor Reviews", report_q5_page),
+        ("Posters With No Poor Reviews", report_q6_page),
+    ]
+    for label, command in report_buttons:
+        btn = tk.Button(
+            root, text=label, width=34, bg="#673AB7", fg="black", activeforeground="black",
+            font=("Arial", 9, "bold"), command=command,
+        )
+        btn.pack(pady=4)
+        register_widget(btn)
+
+    back_lbl = tk.Label(root, text="Back to Home", cursor="hand2", font=("Arial", 8, "underline"))
+    back_lbl.pack(pady=10)
+    back_lbl.bind("<Button-1>", home_menu)
+    register_widget(back_lbl)
+
+
+def report_q1_page(e=None):
+    clear_screen()
+    root.geometry("760x500")
+    ui_values["title"] = tk.Label(
+        root, text="Most Expensive Items in Each Category", font=("Arial", 14, "bold"),
+    )
+    ui_values["title"].pack(pady=8)
+
+    ui_values["verify_btn"] = tk.Button(
+        root, text="Run Query", width=15, bg="#673AB7", fg="black", activeforeground="black",
+        font=("Arial", 10, "bold"), command=run_report_q1,
+    )
+    ui_values["verify_btn"].pack(pady=4)
+
+    columns = ("category", "id", "title", "price", "postedBy")
+    headings = ("Category", "ID", "Title", "Price", "Posted By")
+    widths = (110, 45, 180, 80, 100)
+    tree = create_results_tree(root, columns, headings, widths)
+    ui_values["inputs"]["results_tree"] = tree
+
+    ui_values["err_msg"] = tk.Label(root, text="", fg="red", font=("Arial", 10), wraplength=700)
+    ui_values["err_msg"].pack(pady=4)
+
+    back_lbl = tk.Label(root, text="Back to Reports", cursor="hand2", font=("Arial", 8, "underline"))
+    back_lbl.pack(pady=4)
+    back_lbl.bind("<Button-1>", reports_menu_page)
+    register_widget(back_lbl)
+
+
+def run_report_q1():
+    rows, err = query_most_expensive_per_category()
+    if err:
+        show_err(err)
+        return
+    if not rows:
+        show_err("No Items Found in Database")
+        return
+    clear_err_msg()
+    populate_results_tree(ui_values["inputs"]["results_tree"], rows)
+
+
+def report_q2_page(e=None):
+    clear_screen()
+    root.geometry("760x520")
+    ui_values["title"] = tk.Label(
+        root, text="Users Who Posted Category X and Y on the Same Day", font=("Arial", 14, "bold"),
+    )
+    ui_values["title"].pack(pady=8)
+
+    form = tk.Frame(root)
+    form.pack(pady=4)
+    register_widget(form)
+
+    cat_x_lbl = tk.Label(form, text="Category X:")
+    cat_x_lbl.pack(side=tk.LEFT, padx=5)
+    register_widget(cat_x_lbl)
+    cat_x_val = tk.Entry(form, width=18)
+    cat_x_val.pack(side=tk.LEFT, padx=5)
+    ui_values["inputs"]["category_x"] = cat_x_val
+
+    cat_y_lbl = tk.Label(form, text="Category Y:")
+    cat_y_lbl.pack(side=tk.LEFT, padx=5)
+    register_widget(cat_y_lbl)
+    cat_y_val = tk.Entry(form, width=18)
+    cat_y_val.pack(side=tk.LEFT, padx=5)
+    ui_values["inputs"]["category_y"] = cat_y_val
+
+    ui_values["verify_btn"] = tk.Button(
+        root, text="Run Query", width=15, bg="#673AB7", fg="black", activeforeground="black",
+        font=("Arial", 10, "bold"), command=run_report_q2,
+    )
+    ui_values["verify_btn"].pack(pady=4)
+
+    columns = ("username", "postDate")
+    headings = ("Username", "Post Date")
+    widths = (180, 120)
+    tree = create_results_tree(root, columns, headings, widths)
+    ui_values["inputs"]["results_tree"] = tree
+
+    ui_values["err_msg"] = tk.Label(root, text="", fg="red", font=("Arial", 10), wraplength=700)
+    ui_values["err_msg"].pack(pady=4)
+
+    back_lbl = tk.Label(root, text="Back to Reports", cursor="hand2", font=("Arial", 8, "underline"))
+    back_lbl.pack(pady=4)
+    back_lbl.bind("<Button-1>", reports_menu_page)
+    register_widget(back_lbl)
+
+    root.bind("<Return>", lambda event: run_report_q2())
+
+
+def run_report_q2():
+    cat_x = ui_values["inputs"]["category_x"].get().strip().lower()
+    cat_y = ui_values["inputs"]["category_y"].get().strip().lower()
+    if not cat_x or not cat_y:
+        show_err("Please Enter Both Categories")
+        return
+    if not CATEGORY_PATTERN.match(cat_x) or not CATEGORY_PATTERN.match(cat_y):
+        show_err("Categories Must Be Lowercase Single Words")
+        return
+
+    rows, err = query_users_same_day_categories(cat_x, cat_y)
+    if err:
+        show_err(err)
+        return
+    if not rows:
+        show_err("No Matching Users Found")
+        return
+    clear_err_msg()
+    populate_results_tree(ui_values["inputs"]["results_tree"], rows)
+
+
+def report_q3_page(e=None):
+    clear_screen()
+    root.geometry("760x520")
+    ui_values["title"] = tk.Label(
+        root, text="Items With Only Excellent/Good Reviews", font=("Arial", 14, "bold"),
+    )
+    ui_values["title"].pack(pady=8)
+
+    form = tk.Frame(root)
+    form.pack(pady=4)
+    register_widget(form)
+
+    user_lbl = tk.Label(form, text="Username:")
+    user_lbl.pack(side=tk.LEFT, padx=5)
+    register_widget(user_lbl)
+    user_val = tk.Entry(form, width=25)
+    user_val.pack(side=tk.LEFT, padx=5)
+    ui_values["inputs"]["query_user"] = user_val
+
+    ui_values["verify_btn"] = tk.Button(
+        root, text="Run Query", width=15, bg="#673AB7", fg="black", activeforeground="black",
+        font=("Arial", 10, "bold"), command=run_report_q3,
+    )
+    ui_values["verify_btn"].pack(pady=4)
+
+    columns = ("id", "title", "price", "postDate")
+    headings = ("ID", "Title", "Price", "Post Date")
+    widths = (45, 220, 80, 100)
+    tree = create_results_tree(root, columns, headings, widths)
+    ui_values["inputs"]["results_tree"] = tree
+
+    ui_values["err_msg"] = tk.Label(root, text="", fg="red", font=("Arial", 10), wraplength=700)
+    ui_values["err_msg"].pack(pady=4)
+
+    back_lbl = tk.Label(root, text="Back to Reports", cursor="hand2", font=("Arial", 8, "underline"))
+    back_lbl.pack(pady=4)
+    back_lbl.bind("<Button-1>", reports_menu_page)
+    register_widget(back_lbl)
+
+    root.bind("<Return>", lambda event: run_report_q3())
+
+
+def run_report_q3():
+    username = ui_values["inputs"]["query_user"].get().strip()
+    if not username:
+        show_err("Please Enter a Username")
+        return
+
+    rows, err = query_user_items_good_reviews_only(username)
+    if err:
+        show_err(err)
+        return
+    if not rows:
+        show_err("No Matching Items Found For That User")
+        return
+    clear_err_msg()
+    populate_results_tree(ui_values["inputs"]["results_tree"], rows)
+
+
+def report_q4_page(e=None):
+    clear_screen()
+    root.geometry("760x500")
+    ui_values["title"] = tk.Label(
+        root, text="Most Active Posters on 7/4/2024", font=("Arial", 14, "bold"),
+    )
+    ui_values["title"].pack(pady=8)
+
+    ui_values["verify_btn"] = tk.Button(
+        root, text="Run Query", width=15, bg="#673AB7", fg="black", activeforeground="black",
+        font=("Arial", 10, "bold"), command=run_report_q4,
+    )
+    ui_values["verify_btn"].pack(pady=4)
+
+    columns = ("username", "count")
+    headings = ("Username", "Items Posted")
+    widths = (180, 120)
+    tree = create_results_tree(root, columns, headings, widths)
+    ui_values["inputs"]["results_tree"] = tree
+
+    ui_values["err_msg"] = tk.Label(root, text="", fg="red", font=("Arial", 10), wraplength=700)
+    ui_values["err_msg"].pack(pady=4)
+
+    back_lbl = tk.Label(root, text="Back to Reports", cursor="hand2", font=("Arial", 8, "underline"))
+    back_lbl.pack(pady=4)
+    back_lbl.bind("<Button-1>", reports_menu_page)
+    register_widget(back_lbl)
+
+
+def run_report_q4():
+    rows, err = query_top_posters_on_july_fourth()
+    if err:
+        show_err(err)
+        return
+    if not rows:
+        show_err("No Items Were Posted on 7/4/2024")
+        return
+    clear_err_msg()
+    populate_results_tree(ui_values["inputs"]["results_tree"], rows)
+
+
+def report_q5_page(e=None):
+    clear_screen()
+    root.geometry("760x500")
+    ui_values["title"] = tk.Label(
+        root, text="Users Who Gave Only Poor Reviews", font=("Arial", 14, "bold"),
+    )
+    ui_values["title"].pack(pady=8)
+
+    ui_values["verify_btn"] = tk.Button(
+        root, text="Run Query", width=15, bg="#673AB7", fg="black", activeforeground="black",
+        font=("Arial", 10, "bold"), command=run_report_q5,
+    )
+    ui_values["verify_btn"].pack(pady=4)
+
+    columns = ("reviewer", "count")
+    headings = ("Username", "Review Count")
+    widths = (180, 120)
+    tree = create_results_tree(root, columns, headings, widths)
+    ui_values["inputs"]["results_tree"] = tree
+
+    ui_values["err_msg"] = tk.Label(root, text="", fg="red", font=("Arial", 10), wraplength=700)
+    ui_values["err_msg"].pack(pady=4)
+
+    back_lbl = tk.Label(root, text="Back to Reports", cursor="hand2", font=("Arial", 8, "underline"))
+    back_lbl.pack(pady=4)
+    back_lbl.bind("<Button-1>", reports_menu_page)
+    register_widget(back_lbl)
+
+
+def run_report_q5():
+    rows, err = query_users_all_poor_reviews()
+    if err:
+        show_err(err)
+        return
+    if not rows:
+        show_err("No Users Found With Only Poor Reviews")
+        return
+    clear_err_msg()
+    populate_results_tree(ui_values["inputs"]["results_tree"], rows)
+
+
+def report_q6_page(e=None):
+    clear_screen()
+    root.geometry("760x500")
+    ui_values["title"] = tk.Label(
+        root, text="Posters Whose Items Never Received Poor Reviews", font=("Arial", 14, "bold"),
+    )
+    ui_values["title"].pack(pady=8)
+
+    ui_values["verify_btn"] = tk.Button(
+        root, text="Run Query", width=15, bg="#673AB7", fg="black", activeforeground="black",
+        font=("Arial", 10, "bold"), command=run_report_q6,
+    )
+    ui_values["verify_btn"].pack(pady=4)
+
+    columns = ("username",)
+    headings = ("Username",)
+    widths = (220,)
+    tree = create_results_tree(root, columns, headings, widths)
+    ui_values["inputs"]["results_tree"] = tree
+
+    ui_values["err_msg"] = tk.Label(root, text="", fg="red", font=("Arial", 10), wraplength=700)
+    ui_values["err_msg"].pack(pady=4)
+
+    back_lbl = tk.Label(root, text="Back to Reports", cursor="hand2", font=("Arial", 8, "underline"))
+    back_lbl.pack(pady=4)
+    back_lbl.bind("<Button-1>", reports_menu_page)
+    register_widget(back_lbl)
+
+
+def run_report_q6():
+    rows, err = query_users_no_poor_reviews_on_items()
+    if err:
+        show_err(err)
+        return
+    if not rows:
+        show_err("No Matching Users Found")
+        return
+    clear_err_msg()
+    populate_results_tree(ui_values["inputs"]["results_tree"], rows)
 
 
 def create_acct_success_page():
@@ -736,6 +1323,15 @@ root.title("Project 440 - Online Store")
 root.geometry("400x280")
 root.resizable(False, False)
 root.eval("tk::PlaceWindow . center")
+if not _schema_ok:
+    messagebox.showwarning(
+        "Database Setup Required",
+        "Required tables are missing (item, category, review, etc.).\n\n"
+        "Run this once in Terminal from the project folder:\n\n"
+        "  python3 install_database.py\n\n"
+        "Enter your MySQL Workbench root password when prompted.\n\n"
+        f"Details: {_schema_setup_error}",
+    )
 login_page(e=None)
 
 root.mainloop()
