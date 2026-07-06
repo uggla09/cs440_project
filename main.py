@@ -406,6 +406,7 @@ def get_selected_item_id():
 
 
 def open_review_page():
+    ui_values["selected_item"] = None
     item_id = get_selected_item_id()
     if item_id is None:
         show_err("Please Select an Item From the List")
@@ -664,7 +665,7 @@ def clear_screen():
             widget.destroy()
     ui_values["inputs"].clear()
     ui_values["extra"].clear()
-    ui_values["selected_item"] = None
+    # ui_values["selected_item"] = None
 
 
 def login_page(e):

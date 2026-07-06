@@ -17,3 +17,6 @@ CREATE TABLE IF NOT EXISTS user (
   CONSTRAINT u_email UNIQUE (email),
   CONSTRAINT u_phone UNIQUE (phone)
 );
+
+INSERT INTO user (username, password, firstName, lastName, email, phone)
+VALUES ("123", "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3", "Test", "User","user@test.com", 1234555);
